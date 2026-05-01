@@ -1,0 +1,9 @@
+/composer.phar
+/composer.lock
+/vendor/
+/tests/node_modules/
+/tests/cypress/screenshots/
+/tests/cypress/videos/
+
+.DS_Store
+site
