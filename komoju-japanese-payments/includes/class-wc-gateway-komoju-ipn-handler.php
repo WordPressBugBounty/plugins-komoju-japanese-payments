@@ -107,12 +107,31 @@ class WC_Gateway_Komoju_IPN_Handler extends WC_Gateway_Komoju_Response
             return;
         }
 
+        $new_merchant = isset($post['merchant_name']) ? $post['merchant_name'] : '';
+        $old_merchant = get_option('komoju_woocommerce_connected_merchant_name');
+
         update_option('komoju_woocommerce_secret_key', $post['secret_key']);
         update_option('komoju_woocommerce_publishable_key', $post['publishable_key']);
         update_option('komoju_woocommerce_webhook_secret', $post['webhook_secret']);
         delete_option('komoju_woocommerce_nonce');
 
-        update_option('komoju_woocommerce_just_connected_merchant_name', $post['merchant_name']);
+        // Reconnecting to a different merchant invalidates any cached payment-method
+        // selections and per-gateway settings from the previous credentials. Without
+        // this, checkout continues to render the previous merchant's payment methods
+        // even though the KOMOJU settings page correctly shows the new merchant's list.
+        if ($old_merchant !== $new_merchant) {
+            $previous_types = get_option('komoju_woocommerce_payment_types');
+            if (is_array($previous_types)) {
+                foreach ($previous_types as $slug) {
+                    delete_option('woocommerce_komoju_' . $slug . '_settings');
+                }
+            }
+            delete_option('komoju_woocommerce_payment_types');
+            delete_option('komoju_woocommerce_payment_methods');
+        }
+
+        update_option('komoju_woocommerce_connected_merchant_name', $new_merchant);
+        update_option('komoju_woocommerce_just_connected_merchant_name', $new_merchant);
 
         wp_safe_redirect(admin_url('admin.php?page=wc-settings&tab=komoju_settings'));
         exit;
@@ -261,7 +280,44 @@ class WC_Gateway_Komoju_IPN_Handler extends WC_Gateway_Komoju_Response
      */
     protected function payment_status_cancelled($order, $webhookEvent)
     {
-        WC_Gateway_Komoju::log('Payment cancelled for Order #' . $order->get_id() . '. Order status not updated — customer may retry.');
+        if (!$this->is_order_cancellable($order, $webhookEvent)) {
+            WC_Gateway_Komoju::log('Aborting cancelled/expired webhook for Order #' . $order->get_id() . ': order is not cancellable or the webhook is from a stale session.');
+
+            return;
+        }
+
+        /* translators: %s: payment status */
+        $order->update_status('cancelled', sprintf(__('Payment %s via IPN.', 'komoju-japanese-payments'), wc_clean($webhookEvent->status())));
+    }
+
+    /**
+     * Determine whether an order may be cancelled by a cancelled/expired webhook.
+     *
+     * @param WC_Order $order
+     * @param WC_Gateway_Komoju_Webhook_Event $webhookEvent Webhook event data
+     *
+     * @return bool true if the order is cancellable
+     */
+    protected function is_order_cancellable($order, $webhookEvent)
+    {
+        if ($order->is_paid() || $order->has_status('refunded')) {
+            return false;
+        }
+
+        // Ignore stale cancellations from earlier payment attempts.
+        $komoju_session_id = $order->get_meta('komoju_session_id');
+        if (!empty($komoju_session_id)) {
+            return $komoju_session_id === $webhookEvent->session_id();
+        }
+
+        // Legacy: orders created before session tracking used transaction_id.
+        $transaction_id = $order->get_transaction_id();
+        if (empty($transaction_id)) {
+            return false;
+        }
+
+        return $transaction_id == $webhookEvent->uuid()
+            || $transaction_id == $webhookEvent->external_order_num();
     }
 
     /**
@@ -272,7 +328,7 @@ class WC_Gateway_Komoju_IPN_Handler extends WC_Gateway_Komoju_Response
      */
     protected function payment_status_expired($order, $webhookEvent)
     {
-        WC_Gateway_Komoju::log('Payment expired for Order #' . $order->get_id() . '. Order status not updated — customer may retry.');
+        $this->payment_status_cancelled($order, $webhookEvent);
     }
 
     /**
